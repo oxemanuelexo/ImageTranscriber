@@ -3,5 +3,3 @@ openai>=1.41
 python-dotenv>=1.0
 Pillow>=10.3
 PyMuPDF>=1.24
-# Optional: only needed for the drag UI. If it gives you trouble, you can remove it and use the fallback method.
-streamlit-elements==0.1.*

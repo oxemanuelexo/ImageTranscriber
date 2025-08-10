@@ -1,331 +1,334 @@
 import os
 import io
+import re
 import base64
 import asyncio
-from dataclasses import dataclass
-from typing import List, Tuple, Dict, Optional
+from typing import List, Dict, Tuple
 
 import streamlit as st
+from PIL import Image, ImageOps, UnidentifiedImageError, ImageSequence
 from dotenv import load_dotenv
-from PIL import Image, ImageOps
-import pypdfium2 as pdfium
-import pandas as pd
 
-from st_aggrid import AgGrid, GridOptionsBuilder, JsCode, GridUpdateMode
+import fitz  # PyMuPDF
+from openai import AsyncOpenAI, APIStatusError
 
-import openai
-from openai import AsyncOpenAI
+# Drag-and-drop sorting (thumbnails)
+# docs & usage: https://pypi.org/project/streamlit-sortables/
+from streamlit_sortables import sort_items  # pip install streamlit-sortables
 
-# -------------------- Config --------------------
-st.set_page_config(page_title="Image Transcriber (GPT‑5)", layout="wide")
+# -----------------------------
+# App setup
+# -----------------------------
 load_dotenv()
+st.set_page_config(page_title="Image Transcriber · GPT‑5 (No OCR)", layout="wide")
+st.title("🖼️→📝 Image Transcriber (GPT‑5, no OCR)")
 
-SUPPORTED_IMG_EXT = {"png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"}
-SUPPORTED_DOC_EXT = {"pdf"}
-THUMB_MAX = 240
-SEND_MAX_SIDE = 2200
-DEFAULT_CONCURRENCY = 6
-MODEL_NAME = "gpt-5"
+st.markdown(
+    """
+This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible text.
+It **does not** use OCR libraries.
 
-# -------------------- Models --------------------
-@dataclass
-class Item:
-    id: str
-    label: str
-    is_pdf_page: bool
-    page_num: Optional[int]
-    mime: str
-    send_data_url: str
-    thumb_data_url: str
-
-# -------------------- Utils --------------------
-def unique_key(prefix: str, *bits: str) -> str:
-    return prefix + "::" + "::".join(str(b) for b in bits)
-
-def pil_from_upload(uploaded) -> Image.Image:
-    img = Image.open(uploaded)
-    if getattr(img, "is_animated", False):
-        img.seek(0)
-    # respect EXIF orientation
-    return ImageOps.exif_transpose(img.convert("RGBA"))
-
-def resize_keep_aspect(img: Image.Image, max_side: int) -> Image.Image:
-    w, h = img.size
-    m = max(w, h)
-    if m <= max_side:
-        return img
-    scale = max_side / float(m)
-    return img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-def to_data_url(img: Image.Image, preferred: str = "PNG", quality: int = 90) -> Tuple[str, str]:
-    bio = io.BytesIO()
-    fmt = preferred.upper()
-    if fmt == "JPEG":
-        img = img.convert("RGB")
-        img.save(bio, format="JPEG", quality=quality, optimize=True)
-        mime = "image/jpeg"
-    else:
-        img.save(bio, format="PNG", optimize=True)
-        mime = "image/png"
-    b64 = base64.b64encode(bio.getvalue()).decode("utf-8")
-    return mime, f"data:{mime};base64,{b64}"
-
-def make_thumbnail(img: Image.Image, size: int = THUMB_MAX) -> Image.Image:
-    t = img.copy()
-    t.thumbnail((size, size))
-    return t
-
-def render_pdf_to_images(file_bytes: bytes, dpi: int = 300) -> List[Image.Image]:
-    pdf = pdfium.PdfDocument(io.BytesIO(file_bytes))
-    pages = []
-    scale = dpi / 72.0
-    for i in range(len(pdf)):
-        page = pdf.get_page(i)
-        pil = page.render(scale=scale).to_pil()
-        pages.append(pil.convert("RGBA"))
-    return pages
-
-def signature_of_uploads(files) -> Tuple[Tuple[str, int], ...]:
-    return tuple((f.name, getattr(f, "size", 0)) for f in files)
-
-def build_items_from_uploads(files) -> List[Item]:
-    items: List[Item] = []
-    for f in files:
-        name = f.name
-        ext = name.split(".")[-1].lower()
-        blob = f.read()
-        if ext in SUPPORTED_DOC_EXT:
-            pages = render_pdf_to_images(blob, dpi=300)
-            for idx, page_img in enumerate(pages, start=1):
-                full_img = resize_keep_aspect(page_img, SEND_MAX_SIDE)
-                thumb_img = make_thumbnail(full_img)
-                send_mime, send_url = to_data_url(full_img, preferred="JPEG")
-                _, thumb_url = to_data_url(thumb_img, preferred="JPEG")
-                items.append(
-                    Item(
-                        id=f"{name}#p{idx:03d}",
-                        label=f"{name} — page {idx}",
-                        is_pdf_page=True,
-                        page_num=idx,
-                        mime=send_mime,
-                        send_data_url=send_url,
-                        thumb_data_url=thumb_url,
-                    )
-                )
-        elif ext in SUPPORTED_IMG_EXT:
-            img = pil_from_upload(io.BytesIO(blob))
-            full_img = resize_keep_aspect(img, SEND_MAX_SIDE)
-            thumb_img = make_thumbnail(full_img)
-            send_mime, send_url = to_data_url(full_img, preferred="JPEG")
-            _, thumb_url = to_data_url(thumb_img, preferred="JPEG")
-            items.append(
-                Item(
-                    id=name,
-                    label=name,
-                    is_pdf_page=False,
-                    page_num=None,
-                    mime=send_mime,
-                    send_data_url=send_url,
-                    thumb_data_url=thumb_url,
-                )
-            )
-        else:
-            st.warning(f"Skipping unsupported file type: {name}")
-    return items
-
-# -------------------- OpenAI --------------------
-def build_instructions(use_code_interpreter: bool) -> str:
-    base = (
-        "You are a meticulous visual transcriber. You are given exactly ONE image. "
-        "Transcribe the human‑readable text precisely as it appears in the image: keep line breaks, punctuation, emoji, "
-        "capitalization, lists, math, tables (as plain text), and spacing when it changes meaning. "
-        "Do NOT summarize, comment, guess missing text, or add metadata. "
-        "Absolutely do NOT use OCR libraries or any external tools; rely only on visual inspection of the image. "
-        "Your entire output MUST be only the transcription. No preface, no labels."
-    )
-    if use_code_interpreter:
-        base += (
-            " You may use the Code Interpreter tool to crop, rotate, zoom, or otherwise enhance the image for readability, "
-            "but you must not use OCR libraries or external services."
-        )
-    return base
-
-async def transcribe_one(async_client: AsyncOpenAI, item: Item, use_code_interpreter: bool) -> Tuple[str, str]:
-    instructions = build_instructions(use_code_interpreter)
-    input_payload = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "Transcribe the text in this image. Output only the transcription."},
-                {"type": "input_image", "image_url": item.send_data_url},
-            ],
-        }
-    ]
-    kwargs = {}
-    if use_code_interpreter:
-        kwargs["tools"] = [{"type": "code_interpreter", "container": {"type": "auto"}}]
-    try:
-        resp = await async_client.responses.create(
-            model=MODEL_NAME,
-            instructions=instructions,
-            input=input_payload,
-            **kwargs,
-        )
-        text = (resp.output_text or "").strip()
-        return item.id, text
-    except openai.APIError as e:
-        return item.id, f"[ERROR] {str(e)}"
-    except Exception as e:
-        return item.id, f"[ERROR] {str(e)}"
-
-async def transcribe_all(items_in_order: List[Item], use_code_interpreter: bool, concurrency: int) -> Dict[str, str]:
-    sem = asyncio.Semaphore(concurrency)
-    async with AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY")) as async_client:
-        async def run_one(it: Item):
-            async with sem:
-                return await transcribe_one(async_client, it, use_code_interpreter)
-        results = await asyncio.gather(*(run_one(it) for it in items_in_order))
-    return dict(results)
-
-# -------------------- Session State (use bracket keys!) --------------------
-for k, default in {
-    "doc_items": [],
-    "doc_order": [],
-    "upload_sig": None,
-    "uploader_key": 0,
-    "combined_output": "",
-    "per_item_output": {},
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = default
-
-# -------------------- Sidebar --------------------
-with st.sidebar:
-    st.header("Options")
-    use_code = st.toggle("Use Code Interpreter", value=True, help="Enable/disable Code Interpreter for light image pre-processing (no OCR).")
-    concurrency = st.slider("Parallel requests", 1, 12, DEFAULT_CONCURRENCY, help="How many images to transcribe simultaneously.")
-    if st.button("🔄 Reset app", type="secondary", use_container_width=True, key="reset_btn"):
-        st.session_state["doc_items"] = []
-        st.session_state["doc_order"] = []
-        st.session_state["per_item_output"] = {}
-        st.session_state["combined_output"] = ""
-        st.session_state["upload_sig"] = None
-        st.session_state["uploader_key"] += 1
-        st.rerun()
-
-st.title("📄➡️🧠 Image Transcriber (GPT‑5)")
-
-# -------------------- Upload --------------------
-uploaded = st.file_uploader(
-    "Drop images or PDFs",
-    type=sorted(list(SUPPORTED_IMG_EXT | SUPPORTED_DOC_EXT)),
-    accept_multiple_files=True,
-    key=f"uploader_{st.session_state['uploader_key']}",
+**Notes**
+- Multiple non‑PDF images: drag the previews to set order; the final transcript follows that order.  
+- PDFs: pages are kept in document order (reordering disabled).  
+- Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
+"""
 )
 
+# --- Sidebar: API, model, options ---
+api_env = os.getenv("OPENAI_API_KEY", "")
+api_key = st.sidebar.text_input(
+    "OpenAI API Key (optional if set via .env)",
+    value=api_env,
+    type="password",
+    help='Set OPENAI_API_KEY in a ".env" file or paste your key here for this session.',
+)
+st.sidebar.subheader("Model & Settings")
+model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5. Toggle Code Interpreter below.")
+use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
+max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
+dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
+st.sidebar.caption("Higher DPI ⇒ sharper PDF images ⇒ better transcription (slower).")
+
+# --- Reset / Clear ---
+if "uploader_key" not in st.session_state:
+    st.session_state["uploader_key"] = 1
+
+def reset_all():
+    for k in ("items", "contains_pdf", "uploaded_signature"):
+        st.session_state.pop(k, None)
+    st.session_state["uploader_key"] += 1
+
+if st.sidebar.button("🔁 Reset / Clear files"):
+    reset_all()
+    st.rerun()
+
+# --- Session state ---
+if "items" not in st.session_state:
+    st.session_state["items"] = []  # [{bytes, mime, label, from_pdf, thumb_b64}]
+if "contains_pdf" not in st.session_state:
+    st.session_state["contains_pdf"] = False
+
+# -----------------------------
+# Helpers
+# -----------------------------
+ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
+
+def _ensure_png(image: Image.Image) -> bytes:
+    buf = io.BytesIO()
+    if image.mode not in ("RGB", "L", "RGBA"):
+        image = image.convert("RGB")
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
+    img = Image.open(io.BytesIO(png_bytes))
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((max_side, max_side))
+    b = io.BytesIO()
+    img.save(b, format="PNG")
+    return b.getvalue()
+
+def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
+    try:
+        img = Image.open(io.BytesIO(bytes_data))
+        if getattr(img, "is_animated", False) and img.format == "TIFF":
+            img = ImageSequence.Iterator(img).__next__()
+        img = ImageOps.exif_transpose(img)
+        png_bytes = _ensure_png(img)
+        return png_bytes, "image/png", name
+    except UnidentifiedImageError:
+        raise
+    except Exception:
+        raise
+
+def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
+    images = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            zoom = dpi / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            images.append(pix.tobytes("png"))
+    finally:
+        doc.close()
+    return images
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
+    """
+    Create items:
+      - images: one item each
+      - PDFs: one item per page (in order)
+    Each item gets a small base64 thumbnail for the drag UI.
+    """
+    items = []
+    contains_pdf = False
+    for f in uploaded_files:
+        name = f.name
+        raw = f.read()
+        ext = name.split(".")[-1].lower()
+
+        if ext == "pdf":
+            contains_pdf = True
+            pages = _pdf_to_png_pages(raw, dpi=dpi)
+            for i, pbytes in enumerate(pages, start=1):
+                thumb = _make_thumb_bytes(pbytes)
+                items.append({
+                    "bytes": pbytes,
+                    "mime": "image/png",
+                    "label": f"{name} - page {i}",
+                    "from_pdf": True,
+                    "thumb_b64": _b64(thumb),
+                })
+        else:
+            try:
+                png_bytes, mime, label = _read_single_image(name, raw)
+                thumb = _make_thumb_bytes(png_bytes)
+                items.append({
+                    "bytes": png_bytes,
+                    "mime": mime,
+                    "label": label,
+                    "from_pdf": False,
+                    "thumb_b64": _b64(thumb),
+                })
+            except Exception:
+                st.warning(f"Couldn't read file: {name}. Unsupported or corrupted.", icon="⚠️")
+    return items, contains_pdf
+
+def to_data_url(image_bytes: bytes, mime: str) -> str:
+    return f"data:{mime};base64,{_b64(image_bytes)}"
+
+def build_instructions(use_code_interpreter: bool) -> str:
+    base = (
+        "You are a meticulous transcriptionist. "
+        "Your job is to transcribe *only* the visible text in an image, preserving reading order and line breaks. "
+        "Do not add commentary, labels, or explanations. "
+        "Do not describe graphics. Output must be just the transcription text. "
+        "If no text is clearly legible, output exactly: [no text]. "
+    )
+    ci = (
+        "You may use the code interpreter to crop, rotate, zoom, or otherwise enhance the image for readability, "
+        "but you must not use OCR libraries or external tools."
+    )
+    return base + (ci if use_code_interpreter else "")
+
+TRANSCRIBE_PROMPT = (
+    "Transcribe all visible text from this image as plain UTF‑8 text. "
+    "Preserve line breaks and layout where it helps readability. "
+    "Do not add any extra words before or after. "
+    "If text is partially unreadable, use the character “?” for ambiguous glyphs."
+)
+
+async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_interpreter: bool) -> str:
+    data_url = to_data_url(item["bytes"], item["mime"])
+    kwargs = dict(
+        model=model,
+        instructions=build_instructions(use_code_interpreter),
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": TRANSCRIBE_PROMPT},
+                {"type": "input_image", "image_url": data_url},
+            ],
+        }],
+    )
+    if use_code_interpreter:
+        kwargs["tools"] = [{"type": "code_interpreter", "container": {"type": "auto"}}]
+
+    resp = await client.responses.create(**kwargs)
+    return (resp.output_text or "").strip()
+
+async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrency: int, use_code_interpreter: bool) -> List[str]:
+    sem = asyncio.Semaphore(concurrency)
+    async with AsyncOpenAI(api_key=api_key) as client:
+        async def bound_call(it: Dict) -> str:
+            async with sem:
+                try:
+                    return await transcribe_one(client, it, model, use_code_interpreter)
+                except APIStatusError as e:
+                    return f"[error {e.status_code}] {getattr(e, 'message', '') or 'API error'}"
+                except Exception as e:
+                    return f"[error] {str(e)}"
+        tasks = [asyncio.create_task(bound_call(it)) for it in items]
+        return await asyncio.gather(*tasks)
+
+def show_thumbnails(items: List[Dict]):
+    cols = st.columns(4)
+    for i, it in enumerate(items):
+        with cols[i % 4]:
+            st.image(it["bytes"], caption=it["label"], use_container_width=True)
+
+def drag_reorder_ui():
+    """
+    Drag-and-drop reordering using streamlit-sortables.
+    Each visual item is a tiny HTML snippet that includes a thumbnail and a hidden ID tag.
+    """
+    items = st.session_state["items"]
+    html_items = []
+    # Build small CSS once
+    st.markdown(
+        """
+        <style>
+        .thumb-item { display:flex; align-items:center; gap:0.6rem; padding:0.35rem 0.5rem; }
+        .thumb-item img { width:72px; height:72px; object-fit:cover; border-radius:6px; border:1px solid rgba(0,0,0,.1); }
+        .thumb-item .lbl { font-size:0.9rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    for idx, it in enumerate(items):
+        # Hidden ID marker lets us map the sorted strings back to item indices
+        html = (
+            f'<div class="thumb-item">'
+            f'<img src="data:image/png;base64,{it["thumb_b64"]}" />'
+            f'<span class="lbl">{it["label"]}</span>'
+            f'<span style="display:none">__ID:{idx}__</span>'
+            f"</div>"
+        )
+        html_items.append(html)
+
+    sorted_html = sort_items(html_items) or html_items
+    # Extract new order by the hidden IDs
+    order: List[int] = []
+    for s in sorted_html:
+        m = re.search(r"__ID:(\d+)__", s)
+        if m:
+            order.append(int(m.group(1)))
+    if order and len(order) == len(items):
+        st.session_state["items"] = [items[i] for i in order]
+
+# -----------------------------
+# Upload & preparation
+# -----------------------------
+uploaded = st.file_uploader(
+    "Upload images or PDFs",
+    key=f"uploader_{st.session_state['uploader_key']}",
+    type=ACCEPTED_TYPES,
+    accept_multiple_files=True,
+    help="You can upload multiple images (PNG, JPG, WebP, TIFF, BMP, GIF) or PDFs.",
+)
+
+# Only (re)prepare when files actually changed (prevents wiping custom order on rerun)
 if uploaded:
-    sig = signature_of_uploads(uploaded)
-    if sig != st.session_state["upload_sig"]:
-        st.session_state["doc_items"] = build_items_from_uploads(uploaded)
-        st.session_state["doc_order"] = [it.id for it in st.session_state["doc_items"]]
-        st.session_state["upload_sig"] = sig
-        st.session_state["per_item_output"] = {}
-        st.session_state["combined_output"] = ""
+    signature = tuple((f.name, getattr(f, "size", None)) for f in uploaded)
+    if st.session_state.get("uploaded_signature") != signature:
+        items, contains_pdf = prepare_items(uploaded)
+        st.session_state["items"] = items
+        st.session_state["contains_pdf"] = contains_pdf
+        st.session_state["uploaded_signature"] = signature
 
-# -------------------- Reorder UI (drag & drop) --------------------
-if st.session_state["doc_items"]:
-    items: List[Item] = st.session_state["doc_items"]
+items = st.session_state["items"]
+contains_pdf = st.session_state["contains_pdf"]
 
-    df = pd.DataFrame(
-        {
-            "id": [it.id for it in items],
-            "Preview": [it.thumb_data_url for it in items],
-            "Label": [it.label for it in items],
-        }
-    )
+if items:
+    st.subheader("Preview")
+    show_thumbnails(items)
 
-    gb = GridOptionsBuilder.from_dataframe(df, editable=False)
-    img_renderer = JsCode("""
-        function(params) {
-            var url = params.value;
-            if (!url) return '';
-            return `<img src="${url}" style="height:72px;object-fit:contain;border-radius:6px;" />`;
-        }
-    """)
-    gb.configure_column("id", header_name="id", hide=True)
-    gb.configure_column("Preview", header_name="Preview", cellRenderer=img_renderer, width=110, pinned="left")
-    gb.configure_column("Label", header_name="Label (drag to reorder)", rowDrag=True, autoHeight=True)
-    gb.configure_grid_options(rowDragManaged=True, animateRows=False, suppressMovableColumns=True)
+    if contains_pdf:
+        st.info("PDF detected. Page order is fixed to the document’s order. Reordering is disabled.", icon="📄")
+    else:
+        st.subheader("Reorder by dragging the previews")
+        drag_reorder_ui()
 
-    grid = AgGrid(
-        df,
-        gridOptions=gb.build(),
-        allow_unsafe_jscode=True,
-        update_mode=GridUpdateMode.MODEL_CHANGED,
-        data_return_mode="AS_INPUT",
-        height=min(600, 105 + 80 * len(items)),
-        fit_columns_on_grid_load=True,
-        enable_enterprise_modules=False,
-        key="reorder_grid",
-    )
+    st.divider()
 
-    # Capture new order by the hidden 'id' column (robust even if labels duplicate)
-    new_df = grid["data"]
-    if "id" in new_df.columns:
-        new_order = list(new_df["id"])
-        if new_order and new_order != st.session_state["doc_order"]:
-            st.session_state["doc_order"] = new_order
-
-    st.caption("Drag rows to change order. The final combined transcription follows this order.")
-
-    col_run, _ = st.columns([1, 3])
-    with col_run:
-        start = st.button("🚀 Transcribe", type="primary", key="go_btn")
-    if start:
-        id_to_item = {it.id: it for it in items}
-        ordered_items = [id_to_item[i] for i in st.session_state["doc_order"] if i in id_to_item]
-        with st.spinner("Transcribing images with GPT‑5..."):
-            transcripts_map = asyncio.run(
-                transcribe_all(ordered_items, use_code_interpreter=use_code, concurrency=concurrency)
-            )
-        st.session_state["per_item_output"] = transcripts_map
-        st.session_state["combined_output"] = "\n\n".join(
-            [transcripts_map.get(it.id, "").strip() for it in ordered_items]
-        ).strip()
-
-# -------------------- Outputs --------------------
-if st.session_state["per_item_output"]:
-    st.subheader("Per‑image transcriptions")
-    id_to_item = {it.id: it for it in st.session_state["doc_items"]}
-    for idx, item_id in enumerate(st.session_state["doc_order"], start=1):
-        it = id_to_item.get(item_id)
-        if not it:
-            continue
-        with st.expander(f"{idx}. {it.label}", expanded=False):
-            st.image(it.thumb_data_url, caption=it.label, use_container_width=False)
-            st.text_area(
-                "Transcription (read‑only)",
-                st.session_state["per_item_output"].get(item_id, ""),
-                height=180,
-                key=unique_key("ta", item_id),
+    can_run = bool(api_key or api_env)
+    if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
+        with st.status("Transcribing… running parallel requests", expanded=True) as status:
+            results = asyncio.run(
+                transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
             )
 
-if st.session_state["combined_output"]:
-    st.subheader("Combined transcription (ordered)")
-    st.text_area(
-        "Combined",
-        st.session_state["combined_output"],
-        height=240,
-        key=unique_key("combined_ta", "final"),
-    )
-    st.download_button(
-        "⬇️ Download .txt",
-        data=st.session_state["combined_output"],
-        file_name="transcription.txt",
-        mime="text/plain",
-        key="dl_btn",
-    )
+            st.write("Per‑image results")
+            for idx, (it, text) in enumerate(zip(st.session_state["items"], results)):
+                with st.expander(it["label"], expanded=False):
+                    st.text_area("Transcription", value=text, height=200, key=f"transcription_{idx}")
+
+            final_text = "\n\n".join(results).strip()
+
+            st.subheader("Combined transcription")
+            st.text_area("All pages/images combined", value=final_text, height=320, key="combined_text")
+
+            st.download_button(
+                "Download as .txt",
+                data=final_text.encode("utf-8"),
+                file_name="transcription.txt",
+                mime="text/plain",
+                key="download_txt",
+            )
+
+            status.update(label="Done!", state="complete", expanded=False)
 else:
-    st.info("Upload files, drag to reorder, then click **Transcribe** to generate the combined result.")
+    st.caption("Upload images or PDFs to begin.")
 
-st.caption("No OCR libraries are used. One image per request. Toggle Code Interpreter on/off from the sidebar.")
+st.markdown(
+    """
+---
+**Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
+**Drag reorder**: powered by `streamlit-sortables`.  
+"""
+)

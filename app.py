@@ -1,20 +1,30 @@
 import os
 import io
 import re
+import html
 import base64
 import asyncio
 from typing import List, Dict, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps, UnidentifiedImageError, ImageSequence
 from dotenv import load_dotenv
 
+# PDF rendering (fast, single wheel on macOS)
 import fitz  # PyMuPDF
+
+# Optional HEIC support: use if pillow-heif is present (not strictly required)
+try:
+    import pillow_heif  # type: ignore
+    pillow_heif.register_heif_opener()
+    HEIC_OK = True
+except Exception:
+    HEIC_OK = False
+
+# OpenAI SDK (Responses API + async client)
 from openai import AsyncOpenAI, APIStatusError
 
-# Drag-and-drop sorting (thumbnails)
-# docs & usage: https://pypi.org/project/streamlit-sortables/
-from streamlit_sortables import sort_items  # pip install streamlit-sortables
 
 # -----------------------------
 # App setup
@@ -25,11 +35,11 @@ st.title("🖼️→📝 Image Transcriber (GPT‑5, no OCR)")
 
 st.markdown(
     """
-This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible text.
-It **does not** use OCR libraries.
+This app sends your images (or PDF pages) to **GPT‑5** (optionally with **Code Interpreter**)  
+to transcribe visible text. It **does not** use OCR libraries.
 
 **Notes**
-- Multiple non‑PDF images: drag the previews to set order; the final transcript follows that order.  
+- Multiple non‑PDF images: **drag the previews** to set order; the final transcript follows that order.  
 - PDFs: pages are kept in document order (reordering disabled).  
 - Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
 """
@@ -41,10 +51,11 @@ api_key = st.sidebar.text_input(
     "OpenAI API Key (optional if set via .env)",
     value=api_env,
     type="password",
-    help='Set OPENAI_API_KEY in a ".env" file or paste your key here for this session.',
+    help='Add OPENAI_API_KEY to a ".env" file or paste your key here.',
 )
+
 st.sidebar.subheader("Model & Settings")
-model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5. Toggle Code Interpreter below.")
+model = st.sidebar.text_input("Model", value="gpt-5", help="GPT‑5 with optional Code Interpreter.")
 use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
 max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
 dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
@@ -69,19 +80,26 @@ if "items" not in st.session_state:
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
+
 # -----------------------------
 # Helpers
 # -----------------------------
 ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
+if HEIC_OK:
+    ACCEPTED_TYPES.append("heic")
+
 
 def _ensure_png(image: Image.Image) -> bytes:
+    """Convert PIL image to PNG bytes."""
     buf = io.BytesIO()
     if image.mode not in ("RGB", "L", "RGBA"):
         image = image.convert("RGB")
     image.save(buf, format="PNG")
     return buf.getvalue()
 
+
 def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
+    """Create a small thumbnail (PNG) for the drag UI."""
     img = Image.open(io.BytesIO(png_bytes))
     img = ImageOps.exif_transpose(img)
     img.thumbnail((max_side, max_side))
@@ -89,7 +107,13 @@ def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
     img.save(b, format="PNG")
     return b.getvalue()
 
+
+def _b64(data: bytes) -> str:
+    return base64.b64encode(data).decode("utf-8")
+
+
 def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
+    """Read any supported image and normalize to PNG bytes."""
     try:
         img = Image.open(io.BytesIO(bytes_data))
         if getattr(img, "is_animated", False) and img.format == "TIFF":
@@ -102,21 +126,21 @@ def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
     except Exception:
         raise
 
+
 def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
-    images = []
+    """Render each PDF page to PNG bytes using PyMuPDF."""
+    out = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
         for page in doc:
             zoom = dpi / 72.0
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            images.append(pix.tobytes("png"))
+            out.append(pix.tobytes("png"))
     finally:
         doc.close()
-    return images
+    return out
 
-def _b64(data: bytes) -> str:
-    return base64.b64encode(data).decode("utf-8")
 
 def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
     """
@@ -159,8 +183,10 @@ def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
                 st.warning(f"Couldn't read file: {name}. Unsupported or corrupted.", icon="⚠️")
     return items, contains_pdf
 
+
 def to_data_url(image_bytes: bytes, mime: str) -> str:
     return f"data:{mime};base64,{_b64(image_bytes)}"
+
 
 def build_instructions(use_code_interpreter: bool) -> str:
     base = (
@@ -176,12 +202,14 @@ def build_instructions(use_code_interpreter: bool) -> str:
     )
     return base + (ci if use_code_interpreter else "")
 
+
 TRANSCRIBE_PROMPT = (
     "Transcribe all visible text from this image as plain UTF‑8 text. "
     "Preserve line breaks and layout where it helps readability. "
     "Do not add any extra words before or after. "
     "If text is partially unreadable, use the character “?” for ambiguous glyphs."
 )
+
 
 async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_interpreter: bool) -> str:
     data_url = to_data_url(item["bytes"], item["mime"])
@@ -202,9 +230,13 @@ async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_i
     resp = await client.responses.create(**kwargs)
     return (resp.output_text or "").strip()
 
-async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrency: int, use_code_interpreter: bool) -> List[str]:
+
+async def transcribe_all(items: List[Dict], api_key: str, model: str,
+                         concurrency: int, use_code_interpreter: bool) -> List[str]:
+    """Run concurrent transcription tasks—one per image/page."""
     sem = asyncio.Semaphore(concurrency)
     async with AsyncOpenAI(api_key=api_key) as client:
+
         async def bound_call(it: Dict) -> str:
             async with sem:
                 try:
@@ -213,8 +245,10 @@ async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrenc
                     return f"[error {e.status_code}] {getattr(e, 'message', '') or 'API error'}"
                 except Exception as e:
                     return f"[error] {str(e)}"
+
         tasks = [asyncio.create_task(bound_call(it)) for it in items]
         return await asyncio.gather(*tasks)
+
 
 def show_thumbnails(items: List[Dict]):
     cols = st.columns(4)
@@ -222,44 +256,99 @@ def show_thumbnails(items: List[Dict]):
         with cols[i % 4]:
             st.image(it["bytes"], caption=it["label"], use_container_width=True)
 
+
 def drag_reorder_ui():
     """
-    Drag-and-drop reordering using streamlit-sortables.
-    Each visual item is a tiny HTML snippet that includes a thumbnail and a hidden ID tag.
+    Drag‑and‑drop reordering using SortableJS inside a Streamlit HTML component.
+    Shows real thumbnails you can drag. Updates st.session_state['items'].
     """
     items = st.session_state["items"]
-    html_items = []
-    # Build small CSS once
-    st.markdown(
-        """
-        <style>
-        .thumb-item { display:flex; align-items:center; gap:0.6rem; padding:0.35rem 0.5rem; }
-        .thumb-item img { width:72px; height:72px; object-fit:cover; border-radius:6px; border:1px solid rgba(0,0,0,.1); }
-        .thumb-item .lbl { font-size:0.9rem; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    for idx, it in enumerate(items):
-        # Hidden ID marker lets us map the sorted strings back to item indices
-        html = (
-            f'<div class="thumb-item">'
-            f'<img src="data:image/png;base64,{it["thumb_b64"]}" />'
-            f'<span class="lbl">{it["label"]}</span>'
-            f'<span style="display:none">__ID:{idx}__</span>'
-            f"</div>"
-        )
-        html_items.append(html)
 
-    sorted_html = sort_items(html_items) or html_items
-    # Extract new order by the hidden IDs
-    order: List[int] = []
-    for s in sorted_html:
-        m = re.search(r"__ID:(\d+)__", s)
-        if m:
-            order.append(int(m.group(1)))
-    if order and len(order) == len(items):
-        st.session_state["items"] = [items[i] for i in order]
+    # Build the HTML cards with per-item IDs and base64 thumbnails
+    cards_html = []
+    for idx, it in enumerate(items):
+        label = html.escape(it["label"])
+        img_b64 = it["thumb_b64"]  # created during prepare_items()
+        cards_html.append(
+            f'''
+            <li class="card" data-id="{idx}">
+              <img draggable="false" src="data:image/png;base64,{img_b64}" alt="{label}">
+              <div class="label" title="{label}">{label}</div>
+            </li>
+            '''
+        )
+
+    html_block = f"""
+    <ul id="sortable" class="grid">
+      {''.join(cards_html)}
+    </ul>
+
+    <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.0/Sortable.min.js"></script>
+    <script>
+      const el = document.getElementById('sortable');
+      const sendOrder = () => {{
+        const order = Array.from(el.children).map(li => parseInt(li.dataset.id));
+        // Send order back to Streamlit (works inside components.html)
+        Streamlit.setComponentValue(order);
+      }};
+      const sortable = new Sortable(el, {{
+        animation: 150,
+        ghostClass: 'ghost',
+        dragClass: 'drag',
+        onSort: sendOrder
+      }});
+      // Send initial order once so Python receives a value immediately
+      sendOrder();
+    </script>
+
+    <style>
+      .grid {{
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 12px;
+        list-style: none;
+        padding: 0;
+        margin: 0;
+      }}
+      .card {{
+        background: rgba(255,255,255,.05);
+        border: 1px solid rgba(0,0,0,.2);
+        border-radius: 10px;
+        padding: 8px;
+        cursor: grab;
+        user-select: none;
+      }}
+      .card img {{
+        width: 100%;
+        height: 140px;
+        object-fit: contain;
+        background: rgba(0,0,0,.04);
+        border-radius: 6px;
+        display: block;
+      }}
+      .card .label {{
+        margin-top: 6px;
+        font-size: 0.9rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }}
+      .ghost {{ opacity: .5; }}
+      .drag {{ cursor: grabbing; }}
+    </style>
+    """
+
+    # Render component and get back the new order (list of original indices)
+    order = components.html(html_block, height=430, scrolling=True, key="drag_sorter")
+
+    # Apply new order if valid
+    if isinstance(order, list) and len(order) == len(items):
+        try:
+            order = [int(x) for x in order]
+            st.session_state["items"] = [items[i] for i in order]
+        except Exception:
+            pass
+
 
 # -----------------------------
 # Upload & preparation
@@ -269,7 +358,8 @@ uploaded = st.file_uploader(
     key=f"uploader_{st.session_state['uploader_key']}",
     type=ACCEPTED_TYPES,
     accept_multiple_files=True,
-    help="You can upload multiple images (PNG, JPG, WebP, TIFF, BMP, GIF) or PDFs.",
+    help="You can upload multiple images (PNG, JPG, WebP, TIFF, BMP, GIF, HEIC*) or PDFs. "
+         "HEIC requires optional pillow-heif.",
 )
 
 # Only (re)prepare when files actually changed (prevents wiping custom order on rerun)
@@ -300,12 +390,19 @@ if items:
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:
             results = asyncio.run(
-                transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
+                transcribe_all(
+                    st.session_state["items"],
+                    api_key or api_env,
+                    model,
+                    max_concurrency,
+                    use_ci,
+                )
             )
 
             st.write("Per‑image results")
             for idx, (it, text) in enumerate(zip(st.session_state["items"], results)):
                 with st.expander(it["label"], expanded=False):
+                    # UNIQUE KEYS to avoid StreamlitDuplicateElementId
                     st.text_area("Transcription", value=text, height=200, key=f"transcription_{idx}")
 
             final_text = "\n\n".join(results).strip()
@@ -322,6 +419,7 @@ if items:
             )
 
             status.update(label="Done!", state="complete", expanded=False)
+
 else:
     st.caption("Upload images or PDFs to begin.")
 
@@ -329,6 +427,6 @@ st.markdown(
     """
 ---
 **Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
-**Drag reorder**: powered by `streamlit-sortables`.  
+**Drag reorder**: powered by a lightweight SortableJS snippet inside a Streamlit component.  
 """
 )

@@ -1,5 +1,7 @@
 import os
 import io
+import re
+import uuid
 import base64
 import asyncio
 from typing import List, Dict, Tuple
@@ -8,29 +10,33 @@ import streamlit as st
 from PIL import Image, ImageOps, UnidentifiedImageError, ImageSequence
 from dotenv import load_dotenv
 import fitz  # PyMuPDF
+
 from openai import AsyncOpenAI, APIStatusError
 
-# Drag-and-drop list (plain strings)
-from streamlit_sortables import sort_items
+# Drag-and-drop thumbnails via streamlit-elements
+from streamlit_elements import elements, dashboard, mui, html, sync
 
-# -----------------------------
+
+# ───────────────────────────────────────────────────────────────────────────────
 # App setup
-# -----------------------------
+# ───────────────────────────────────────────────────────────────────────────────
 load_dotenv()
 st.set_page_config(page_title="Image Transcriber · GPT‑5 (No OCR)", layout="wide")
 st.title("🖼️→📝 Image Transcriber (GPT‑5, no OCR)")
 
 st.markdown(
     """
-This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible text — **no OCR libraries**.
+This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible text.
+It **does not** use OCR libraries.
 
-- Multiple non‑PDF images: drag the **file names** below to reorder; the final transcript follows that order.  
+**Notes**
+- Multiple non‑PDF images: **drag the previews** to set order; the final transcript follows that order.  
 - PDFs: pages are kept in document order (reordering disabled).  
-- Exactly **one** image/page is sent per request; all requests run **in parallel**.
+- Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
 """
 )
 
-# --- Sidebar: API, model, options ---
+# Sidebar: API & options
 api_env = os.getenv("OPENAI_API_KEY", "")
 api_key = st.sidebar.text_input(
     "OpenAI API Key (optional if set via .env)",
@@ -39,18 +45,18 @@ api_key = st.sidebar.text_input(
     help='Set OPENAI_API_KEY in a ".env" file or paste your key here for this session.',
 )
 st.sidebar.subheader("Model & Settings")
-model = st.sidebar.text_input("Model", value="gpt-5")
+model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5. Toggle Code Interpreter below.")
 use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
 max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
 dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
-st.sidebar.caption("Higher DPI ⇒ sharper PDF pages ⇒ better transcription (slower).")
+st.sidebar.caption("Higher DPI ⇒ sharper PDF images ⇒ better transcription (slower).")
 
-# --- Reset / Clear ---
+# Reset / Clear
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 1
 
 def reset_all():
-    for k in ("items", "contains_pdf", "uploaded_signature"):
+    for k in ("items", "contains_pdf", "uploaded_signature", "reorder_layout"):
         st.session_state.pop(k, None)
     st.session_state["uploader_key"] += 1
 
@@ -58,15 +64,16 @@ if st.sidebar.button("🔁 Reset / Clear files"):
     reset_all()
     st.rerun()
 
-# --- Session state ---
+# Session state
 if "items" not in st.session_state:
-    st.session_state["items"] = []  # [{bytes, mime, label, display_label, from_pdf}]
+    st.session_state["items"] = []  # [{uid, bytes, mime, label, from_pdf, thumb_b64}]
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
-# -----------------------------
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Helpers
-# -----------------------------
+# ───────────────────────────────────────────────────────────────────────────────
 ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
 
 def _ensure_png(image: Image.Image) -> bytes:
@@ -76,11 +83,23 @@ def _ensure_png(image: Image.Image) -> bytes:
     image.save(buf, format="PNG")
     return buf.getvalue()
 
+def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
+    img = Image.open(io.BytesIO(png_bytes))
+    img = ImageOps.exif_transpose(img)
+    img.thumbnail((max_side, max_side))
+    b = io.BytesIO()
+    img.save(b, format="PNG")
+    return b.getvalue()
+
 def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
     try:
         img = Image.open(io.BytesIO(bytes_data))
-        if getattr(img, "is_animated", False) and img.format == "TIFF":
-            img = ImageSequence.Iterator(img).__next__()
+        if getattr(img, "is_animated", False):
+            # Take first frame for GIF/TIFF animations
+            try:
+                img.seek(0)
+            except Exception:
+                pass
         img = ImageOps.exif_transpose(img)
         png_bytes = _ensure_png(img)
         return png_bytes, "image/png", name
@@ -105,28 +124,15 @@ def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
-def uniquify_labels(labels: List[str]) -> List[str]:
-    """Ensure labels are unique by appending ' (2)', ' (3)', ... when needed."""
-    counts = {}
-    out = []
-    for lbl in labels:
-        counts[lbl] = counts.get(lbl, 0) + 1
-        if counts[lbl] == 1:
-            out.append(lbl)
-        else:
-            out.append(f"{lbl} ({counts[lbl]})")
-    return out
-
 def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
     """
     Create items:
       - images: one item each
       - PDFs: one item per page (in order)
-    Also assign a display_label that's guaranteed unique for drag UI.
+    Each item gets a small base64 thumbnail for drag UI and a stable uid.
     """
     items = []
     contains_pdf = False
-    raw_labels = []
 
     for f in uploaded_files:
         name = f.name
@@ -137,22 +143,29 @@ def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
             contains_pdf = True
             pages = _pdf_to_png_pages(raw, dpi=dpi)
             for i, pbytes in enumerate(pages, start=1):
-                label = f"{name} - page {i}"
-                items.append({"bytes": pbytes, "mime": "image/png", "label": label, "from_pdf": True})
-                raw_labels.append(label)
+                thumb = _make_thumb_bytes(pbytes)
+                items.append({
+                    "uid": uuid.uuid4().hex[:8],
+                    "bytes": pbytes,
+                    "mime": "image/png",
+                    "label": f"{name} - page {i}",
+                    "from_pdf": True,
+                    "thumb_b64": _b64(thumb),
+                })
         else:
             try:
                 png_bytes, mime, label = _read_single_image(name, raw)
-                items.append({"bytes": png_bytes, "mime": mime, "label": label, "from_pdf": False})
-                raw_labels.append(label)
+                thumb = _make_thumb_bytes(png_bytes)
+                items.append({
+                    "uid": uuid.uuid4().hex[:8],
+                    "bytes": png_bytes,
+                    "mime": mime,
+                    "label": label,
+                    "from_pdf": False,
+                    "thumb_b64": _b64(thumb),
+                })
             except Exception:
                 st.warning(f"Couldn't read file: {name}. Unsupported or corrupted.", icon="⚠️")
-
-    # Make labels unique for the reorder list, and attach as display_label
-    unique = uniquify_labels(raw_labels)
-    for it, disp in zip(items, unique):
-        it["display_label"] = disp
-
     return items, contains_pdf
 
 def to_data_url(image_bytes: bytes, mime: str) -> str:
@@ -212,31 +225,110 @@ async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrenc
         tasks = [asyncio.create_task(bound_call(it)) for it in items]
         return await asyncio.gather(*tasks)
 
+def safe_run(coro):
+    """Run an async coroutine safely inside Streamlit."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
 def show_thumbnails(items: List[Dict]):
     cols = st.columns(4)
     for i, it in enumerate(items):
         with cols[i % 4]:
             st.image(it["bytes"], caption=it["label"], use_container_width=True)
 
-def drag_reorder_names_ui():
+def drag_reorder_ui():
     """
-    Drag-and-drop reordering with file names (plain strings).
-    Uses unique display_label values to map back to items.
+    Drag-and-drop reordering using streamlit-elements.
+    Each image is a draggable MUI Card with a thumbnail preview.
     """
     items = st.session_state["items"]
-    labels = [it["display_label"] for it in items]
-    # Show a small instruction and the draggable list
-    st.caption("Drag to adjust the order (top → first, bottom → last)")
-    new_order = sort_items(labels, key="sort_names") or labels
+    if not items:
+        return
 
-    # Apply new order if it changed
-    if new_order != labels:
-        lookup = {it["display_label"]: it for it in items}
-        st.session_state["items"] = [lookup[lbl] for lbl in new_order]
+    # Vertical 1-column layout: one card per row.
+    layout = [
+        dashboard.Item(f"item_{it['uid']}", 0, idx, 1, 1, isResizable=False)
+        for idx, it in enumerate(items)
+    ]
 
-# -----------------------------
+    with elements("reorder_board"):
+        with dashboard.Grid(
+            layout,
+            cols=1,                  # vertical list
+            rowHeight=110,           # card height
+            compactType="vertical",
+            draggableHandle=".drag-handle",
+            onLayoutChange=sync("reorder_layout"),
+        ):
+            for it in items:
+                # Key must match dashboard.Item id.
+                with mui.Card(
+                    key=f"item_{it['uid']}",
+                    elevation=1,
+                    sx={
+                        "display": "flex",
+                        "alignItems": "center",
+                        "gap": 12,
+                        "px": 1,
+                        "py": 1,
+                        "overflow": "hidden",
+                    },
+                ):
+                    # Drag handle
+                    mui.Box(
+                        className="drag-handle",
+                        sx={"cursor": "grab", "display": "flex", "alignItems": "center"},
+                    )[mui.icon.DragIndicator()]
+
+                    # Thumbnail
+                    mui.CardMedia(
+                        component="img",
+                        image=f"data:image/png;base64,{it['thumb_b64']}",
+                        sx={
+                            "width": 96,
+                            "height": 96,
+                            "objectFit": "cover",
+                            "borderRadius": "8px",
+                            "border": "1px solid rgba(0,0,0,.08)",
+                            "flexShrink": 0,
+                        },
+                    )
+
+                    # Label
+                    mui.Typography(
+                        it["label"],
+                        sx={
+                            "fontSize": "0.95rem",
+                            "whiteSpace": "nowrap",
+                            "overflow": "hidden",
+                            "textOverflow": "ellipsis",
+                        },
+                    )
+
+    # Apply new order if layout changed
+    layout_update = st.session_state.get("reorder_layout")
+    if layout_update:
+        sorted_uids = [
+            entry["i"].replace("item_", "")
+            for entry in sorted(layout_update, key=lambda e: (e.get("y", 0), e.get("x", 0)))
+        ]
+        uid_to_item = {it["uid"]: it for it in items}
+        new_items = [uid_to_item[u] for u in sorted_uids if u in uid_to_item]
+        if len(new_items) == len(items):
+            st.session_state["items"] = new_items
+        # Clear so we don’t reapply on every rerun
+        st.session_state["reorder_layout"] = None
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # Upload & preparation
-# -----------------------------
+# ───────────────────────────────────────────────────────────────────────────────
 uploaded = st.file_uploader(
     "Upload images or PDFs",
     key=f"uploader_{st.session_state['uploader_key']}",
@@ -264,15 +356,16 @@ if items:
     if contains_pdf:
         st.info("PDF detected. Page order is fixed to the document’s order. Reordering is disabled.", icon="📄")
     else:
-        st.subheader("Reorder by dragging the file names")
-        drag_reorder_names_ui()
+        st.subheader("Reorder by dragging the previews")
+        drag_reorder_ui()
 
     st.divider()
 
+    # Transcribe
     can_run = bool(api_key or api_env)
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:
-            results = asyncio.run(
+            results = safe_run(
                 transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
             )
 
@@ -302,5 +395,6 @@ st.markdown(
     """
 ---
 **Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
+**Drag reorder**: powered by `streamlit-elements`.  
 """
 )

@@ -1,7 +1,7 @@
-streamlit>=1.36
-openai>=1.41
+streamlit>=1.34
+openai>=1.40
 python-dotenv>=1.0
-Pillow>=10.3
-PyMuPDF>=1.24
-# Optional: enable HEIC support on macOS (nice to have, but not required)
-pillow-heif>=0.16 ; platform_system=="Darwin"
+Pillow>=10.0
+pypdfium2>=4.9
+pandas>=2.0
+streamlit-aggrid>=1.1.7

@@ -1,9 +1,9 @@
 import os
 import io
-import re
 import uuid
 import base64
 import asyncio
+import warnings
 from typing import List, Dict, Tuple
 
 import streamlit as st
@@ -13,13 +13,16 @@ from dotenv import load_dotenv
 import fitz  # PyMuPDF
 from openai import AsyncOpenAI, APIStatusError
 
-# Drag & drop UI (renders real thumbnails inside draggable cards)
-from streamlit_elements import elements, dashboard, mui, html, sync
+# Drag & drop UI (MUI + draggable grid)
+from streamlit_elements import elements, dashboard, mui, sync
+
+# Silence a harmless SyntaxWarning in streamlit-elements on Python 3.13
+warnings.filterwarnings("ignore", category=SyntaxWarning)
 
 
-# ---------------------------------
+# =========================
 # App setup
-# ---------------------------------
+# =========================
 load_dotenv()
 st.set_page_config(page_title="Image Transcriber · GPT‑5 (No OCR)", layout="wide")
 st.title("🖼️→📝 Image Transcriber (GPT‑5, no OCR)")
@@ -30,28 +33,28 @@ This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible t
 It **does not** use OCR libraries.
 
 **Notes**
-- Multiple non‑PDF images: drag the previews to set order; the final transcript follows that order.  
+- Multiple non‑PDF images: **drag the previews** to set order; the final transcript follows that order.  
 - PDFs: pages are kept in document order (reordering disabled).  
-- Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
+- Exactly **one** image/page is sent to GPT‑5 per request; all requests run **in parallel**.
 """
 )
 
-# Sidebar: API key, model, options
+# --- Sidebar: API, model, options ---
 api_env = os.getenv("OPENAI_API_KEY", "")
 api_key = st.sidebar.text_input(
     "OpenAI API Key (optional if set via .env)",
     value=api_env,
     type="password",
-    help='Set OPENAI_API_KEY in a ".env" file or paste your key here for this session.',
+    help='Add OPENAI_API_KEY to a ".env" file or paste your key here for this session.',
 )
 st.sidebar.subheader("Model & Settings")
-model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5 (Responses API).")
+model = st.sidebar.text_input("Model", value="gpt-5", help="Use GPT‑5.")
 use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
 max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
 dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
-st.sidebar.caption("Higher DPI ⇒ sharper PDF images ⇒ better transcription (slower).")
+st.sidebar.caption("Higher DPI ⇒ sharper PDF pages ⇒ better transcription (slower).")
 
-# Reset / Clear
+# --- Reset / Clear ---
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 1
 
@@ -64,19 +67,20 @@ if st.sidebar.button("🔁 Reset / Clear files"):
     reset_all()
     st.rerun()
 
-# Session state
+# --- Session state ---
 if "items" not in st.session_state:
     st.session_state["items"] = []  # [{uid, bytes, mime, label, from_pdf, thumb_b64}]
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
 
-# ---------------------------------
+# =========================
 # Helpers
-# ---------------------------------
+# =========================
 ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
 
 def _ensure_png(image: Image.Image) -> bytes:
+    """Convert PIL image to PNG bytes."""
     buf = io.BytesIO()
     if image.mode not in ("RGB", "L", "RGBA"):
         image = image.convert("RGB")
@@ -84,6 +88,7 @@ def _ensure_png(image: Image.Image) -> bytes:
     return buf.getvalue()
 
 def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
+    """Create a small PNG thumbnail for the drag UI."""
     img = Image.open(io.BytesIO(png_bytes))
     img = ImageOps.exif_transpose(img)
     img.thumbnail((max_side, max_side))
@@ -92,8 +97,10 @@ def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
     return b.getvalue()
 
 def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
+    """Read any supported image and return (png_bytes, mime, label)."""
     try:
         img = Image.open(io.BytesIO(bytes_data))
+        # If multi-frame TIFF, take first frame (simple handling)
         if getattr(img, "is_animated", False) and img.format == "TIFF":
             img = ImageSequence.Iterator(img).__next__()
         img = ImageOps.exif_transpose(img)
@@ -105,6 +112,7 @@ def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
         raise
 
 def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
+    """Render each PDF page to PNG bytes using PyMuPDF."""
     images = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -124,8 +132,8 @@ def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
     """
     Create items:
       - images: one item each
-      - PDFs: one item per page (in order)
-    Each item gets a small base64 thumbnail for the drag UI.
+      - PDFs: one item per page (in original order)
+    Each item gets a small base64 thumbnail used by the drag UI, plus a stable uid.
     """
     items = []
     contains_pdf = False
@@ -188,6 +196,7 @@ TRANSCRIBE_PROMPT = (
 )
 
 async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_interpreter: bool) -> str:
+    """Send exactly one image to the model (optionally with Code Interpreter)."""
     data_url = to_data_url(item["bytes"], item["mime"])
     kwargs = dict(
         model=model,
@@ -206,9 +215,8 @@ async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_i
     resp = await client.responses.create(**kwargs)
     return (resp.output_text or "").strip()
 
-async def transcribe_all(
-    items: List[Dict], api_key: str, model: str, concurrency: int, use_code_interpreter: bool
-) -> List[str]:
+async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrency: int, use_code_interpreter: bool) -> List[str]:
+    """Parallel transcription — one request per item."""
     sem = asyncio.Semaphore(concurrency)
     async with AsyncOpenAI(api_key=api_key) as client:
         async def bound_call(it: Dict) -> str:
@@ -230,48 +238,44 @@ def show_thumbnails(items: List[Dict]):
 
 def drag_reorder_ui():
     """
-    Drag-and-drop reordering using streamlit-elements.
-    Each image is shown as a draggable MUI Card with a thumbnail preview.
+    Drag‑and‑drop reordering using streamlit‑elements (MUI cards in a 1‑column draggable grid).
     """
     items = st.session_state["items"]
     if not items:
         return
 
-    # Build vertical 1-column layout: one card per row (y=index).
+    # One card per row (y=index)
     layout = [
         dashboard.Item(f"item_{it['uid']}", 0, idx, 1, 1, isResizable=False)
         for idx, it in enumerate(items)
     ]
 
-    # Render the draggable list inside an Elements frame.
     with elements("reorder_board"):
         with dashboard.Grid(
             layout,
-            cols=1,                 # one column → vertical list
-            rowHeight=110,          # card height
+            cols=1,                  # vertical list
+            rowHeight=110,
             compactType="vertical",
             draggableHandle=".drag-handle",
-            onLayoutChange=sync("reorder_layout"),  # store layout in session_state
+            onLayoutChange=sync("reorder_layout"),
         ):
             for it in items:
-                # Card key MUST match the dashboard.Item id.
+                # The key MUST match the dashboard.Item id.
                 with mui.Card(
                     key=f"item_{it['uid']}",
                     elevation=1,
                     sx={
                         "display": "flex",
                         "alignItems": "center",
-                        "gap": 12,
+                        "gap": 1.2,
                         "px": 1,
                         "py": 1,
                         "overflow": "hidden",
                     },
                 ):
-                    # Drag handle
-                    mui.Box(
-                        className="drag-handle",
-                        sx={"cursor": "grab", "display": "flex", "alignItems": "center"},
-                    )[mui.icon.DragIndicator()]
+                    # Drag handle (use a simple icon)
+                    with mui.Box(className="drag-handle", sx={"cursor": "grab", "display": "flex", "alignItems": "center"}):
+                        mui.icon.DragIndicator()
 
                     # Thumbnail
                     mui.CardMedia(
@@ -284,6 +288,7 @@ def drag_reorder_ui():
                             "borderRadius": "8px",
                             "border": "1px solid rgba(0,0,0,.08)",
                             "flexShrink": 0,
+                            "mr": 1,
                         },
                     )
 
@@ -298,10 +303,10 @@ def drag_reorder_ui():
                         },
                     )
 
-    # If layout changed, apply the new order and rerun so the Preview updates too.
+    # If the layout changed, apply the new order and rerun so the Preview updates.
     layout_update = st.session_state.get("reorder_layout")
     if layout_update:
-        # Sort by y, then x just in case; extract IDs → uids
+        # Sort by y then x; extract IDs -> uids
         sorted_uids = [
             entry["i"].replace("item_", "")
             for entry in sorted(layout_update, key=lambda e: (e.get("y", 0), e.get("x", 0)))
@@ -310,14 +315,13 @@ def drag_reorder_ui():
         new_items = [uid_to_item[u] for u in sorted_uids if u in uid_to_item]
         if len(new_items) == len(items):
             st.session_state["items"] = new_items
-        # Clear and rerun so the "Preview" above reflects the new order.
         st.session_state["reorder_layout"] = None
         st.rerun()
 
 
-# ---------------------------------
+# =========================
 # Upload & preparation
-# ---------------------------------
+# =========================
 uploaded = st.file_uploader(
     "Upload images or PDFs",
     key=f"uploader_{st.session_state['uploader_key']}",
@@ -338,9 +342,9 @@ if uploaded:
 items = st.session_state["items"]
 contains_pdf = st.session_state["contains_pdf"]
 
-# ---------------------------------
+# =========================
 # UI
-# ---------------------------------
+# =========================
 if items:
     st.subheader("Preview")
     show_thumbnails(items)
@@ -353,6 +357,7 @@ if items:
 
     st.divider()
 
+    # Transcribe button
     can_run = bool(api_key or api_env)
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:
@@ -379,6 +384,7 @@ if items:
             )
 
             status.update(label="Done!", state="complete", expanded=False)
+
 else:
     st.caption("Upload images or PDFs to begin.")
 
@@ -386,6 +392,6 @@ st.markdown(
     """
 ---
 **Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
-**Drag reorder**: powered by `streamlit-elements`.  
+**Drag reorder**: implemented with `streamlit-elements` MUI cards.  
 """
 )

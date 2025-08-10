@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>Drag Reorder</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0; padding: 8px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    }
+    ul#list {
+      list-style: none; margin: 0; padding: 0;
+      display: flex; flex-direction: column; gap: 10px;
+    }
+    li.card {
+      display: flex; align-items: center; gap: 12px;
+      border-radius: 10px; padding: 10px;
+      border: 1px solid rgba(0,0,0,0.08);
+      background: rgba(127,127,127,0.08);
+      user-select: none;
+    }
+    li.card.dragging { opacity: 0.6; }
+    img.thumb {
+      width: 96px; height: 96px; object-fit: cover;
+      border-radius: 8px; border: 1px solid rgba(0,0,0,0.08);
+      flex-shrink: 0;
+    }
+    .label {
+      font-size: 0.95rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .grip {
+      cursor: grab; display:flex; align-items:center; font-size: 18px; opacity: 0.6; margin-right: 4px;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <ul id="list"></ul>
+
+  <script type="module">
+    import { Streamlit } from "https://unpkg.com/streamlit-component-lib@latest?module";
+
+    const list = document.getElementById("list");
+
+    function reportOrder() {
+      const uids = Array.from(list.children).map(li => li.dataset.uid);
+      Streamlit.setComponentValue(uids);
+      // adjust iframe height to content
+      Streamlit.setFrameHeight(document.documentElement.scrollHeight);
+    }
+
+    function buildItem(it) {
+      const li = document.createElement("li");
+      li.className = "card";
+      li.draggable = true;
+      li.dataset.uid = it.uid;
+
+      const grip = document.createElement("div");
+      grip.className = "grip";
+      grip.textContent = "⋮⋮";
+      li.appendChild(grip);
+
+      const img = document.createElement("img");
+      img.className = "thumb";
+      img.src = it.thumb;
+      img.alt = it.label;
+      li.appendChild(img);
+
+      const label = document.createElement("div");
+      label.className = "label";
+      label.textContent = it.label;
+      li.appendChild(label);
+
+      // DnD handlers
+      li.addEventListener("dragstart", (e) => {
+        li.classList.add("dragging");
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", li.dataset.uid);
+      });
+      li.addEventListener("dragend", () => li.classList.remove("dragging"));
+      li.addEventListener("dragover", (e) => e.preventDefault());
+      li.addEventListener("drop", (e) => {
+        e.preventDefault();
+        const uid = e.dataTransfer.getData("text/plain");
+        const src = list.querySelector(`li[data-uid="${uid}"]`);
+        if (!src || src === li) return;
+
+        const rect = li.getBoundingClientRect();
+        const after = (e.clientY - rect.top) > rect.height / 2;
+        list.insertBefore(src, after ? li.nextSibling : li);
+        reportOrder();
+      });
+
+      return li;
+    }
+
+    function render(args) {
+      const items = args.items || [];
+      list.innerHTML = "";
+      for (const it of items) {
+        list.appendChild(buildItem(it));
+      }
+      // initial report so Python has the current order
+      reportOrder();
+    }
+
+    function onRender(event) {
+      try {
+        render(event.detail.args || {});
+      } catch (err) {
+        console.error(err);
+      }
+    }
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(0);
+  </script>
+</body>
+</html>

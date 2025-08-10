@@ -1,32 +1,21 @@
 import os
 import io
-import uuid
 import base64
 import asyncio
-import warnings
+import uuid
+from html import escape
 from typing import List, Dict, Tuple
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps, UnidentifiedImageError, ImageSequence
 from dotenv import load_dotenv
-import pandas as pd
-
 import fitz  # PyMuPDF
 from openai import AsyncOpenAI, APIStatusError
 
-# Try to import streamlit-elements (drag UI). If it fails or misbehaves, we have a fallback.
-HAS_ELEMENTS = True
-try:
-    from streamlit_elements import elements, dashboard, mui, sync
-    # Silence a harmless SyntaxWarning in streamlit-elements on Python 3.13
-    warnings.filterwarnings("ignore", category=SyntaxWarning)
-except Exception:
-    HAS_ELEMENTS = False
-
-
-# =========================
+# -----------------------------
 # App setup
-# =========================
+# -----------------------------
 load_dotenv()
 st.set_page_config(page_title="Image Transcriber · GPT‑5 (No OCR)", layout="wide")
 st.title("🖼️→📝 Image Transcriber (GPT‑5, no OCR)")
@@ -37,9 +26,9 @@ This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible t
 It **does not** use OCR libraries.
 
 **Notes**
-- Multiple non‑PDF images: set order (drag thumbnails or use the fallback table); the final transcript follows that order.  
+- Multiple non‑PDF images: **drag the previews** to set order; the final transcript follows that order.  
 - PDFs: pages are kept in document order (reordering disabled).  
-- Exactly **one** image/page is sent to GPT‑5 per request; all requests run **in parallel**.
+- Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
 """
 )
 
@@ -49,30 +38,22 @@ api_key = st.sidebar.text_input(
     "OpenAI API Key (optional if set via .env)",
     value=api_env,
     type="password",
-    help='Add OPENAI_API_KEY to a ".env" file or paste your key here for this session.',
+    help='Set OPENAI_API_KEY in a ".env" file or paste your key here for this session.',
 )
+
 st.sidebar.subheader("Model & Settings")
-model = st.sidebar.text_input("Model", value="gpt-5", help="Use GPT‑5.")
+model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5. Toggle Code Interpreter below.")
 use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
 max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
 dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
 st.sidebar.caption("Higher DPI ⇒ sharper PDF pages ⇒ better transcription (slower).")
-
-# Reorder method toggle
-default_idx = 0 if HAS_ELEMENTS else 1
-reorder_method = st.sidebar.selectbox(
-    "Reorder method",
-    ["Drag thumbnails (beta)", "Simple order editor (fallback)"],
-    index=default_idx,
-    help="If the drag area looks empty, switch to the fallback."
-)
 
 # --- Reset / Clear ---
 if "uploader_key" not in st.session_state:
     st.session_state["uploader_key"] = 1
 
 def reset_all():
-    for k in ("items", "contains_pdf", "uploaded_signature", "reorder_layout"):
+    for k in ("items", "contains_pdf", "uploaded_signature"):
         st.session_state.pop(k, None)
     st.session_state["uploader_key"] += 1
 
@@ -82,14 +63,14 @@ if st.sidebar.button("🔁 Reset / Clear files"):
 
 # --- Session state ---
 if "items" not in st.session_state:
-    st.session_state["items"] = []  # [{uid, bytes, mime, label, from_pdf, thumb_b64, orig_index}]
+    st.session_state["items"] = []  # [{uid, bytes, mime, label, from_pdf, thumb_b64}]
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
 
-# =========================
+# -----------------------------
 # Helpers
-# =========================
+# -----------------------------
 ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
 
 def _ensure_png(image: Image.Image) -> bytes:
@@ -136,10 +117,16 @@ def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
-def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
+def prepare_items(uploaded_files) -> Tuple[List[Dict,], bool]:
+    """
+    Create items:
+      - images: one item each
+      - PDFs: one item per page (in order)
+    Each item gets a small base64 thumbnail for the drag UI and a stable uid.
+    """
     items = []
     contains_pdf = False
-    for idx, f in enumerate(uploaded_files):
+    for f in uploaded_files:
         name = f.name
         raw = f.read()
         ext = name.split(".")[-1].lower()
@@ -156,7 +143,6 @@ def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
                     "label": f"{name} - page {i}",
                     "from_pdf": True,
                     "thumb_b64": _b64(thumb),
-                    "orig_index": len(items),
                 })
         else:
             try:
@@ -169,7 +155,6 @@ def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
                     "label": label,
                     "from_pdf": False,
                     "thumb_b64": _b64(thumb),
-                    "orig_index": len(items),
                 })
             except Exception:
                 st.warning(f"Couldn't read file: {name}. Unsupported or corrupted.", icon="⚠️")
@@ -238,131 +223,149 @@ def show_thumbnails(items: List[Dict]):
         with cols[i % 4]:
             st.image(it["bytes"], caption=it["label"], use_container_width=True)
 
-
-# -------------------------
-# Reordering UIs
-# -------------------------
+# ---------- Pure HTML5 drag‑and‑drop (no external packages) ----------
 def drag_reorder_ui():
     """
-    Drag‑and‑drop reordering using streamlit‑elements (MUI cards).
-    NOTE: If this renders blank in your environment, switch to the fallback below.
-    """
-    items = st.session_state["items"]
-    if not (HAS_ELEMENTS and items):
-        st.info("Drag UI unavailable here. Use the fallback table below.", icon="ℹ️")
-        return
-
-    # Build a vertical list: one card per row.
-    row_height = 110
-    layout = [
-        dashboard.Item(f"item_{it['uid']}", 0, idx, 1, 1, isResizable=False)
-        for idx, it in enumerate(items)
-    ]
-    total_height = max(160, row_height * len(items) + 24)
-
-    with elements("reorder_board"):
-        with dashboard.Grid(
-            layout,
-            cols=1,
-            rowHeight=row_height,
-            compactType="vertical",
-            draggableHandle=".drag-handle",
-            onLayoutChange=sync("reorder_layout"),
-            style={"height": total_height},
-        ):
-            for it in items:
-                with mui.Card(
-                    key=f"item_{it['uid']}",
-                    elevation=1,
-                    sx={
-                        "display": "flex", "alignItems": "center",
-                        "gap": 1.2, "px": 1, "py": 1, "overflow": "hidden",
-                    },
-                ):
-                    with mui.Box(className="drag-handle", sx={"cursor": "grab", "display": "flex", "alignItems": "center"}):
-                        mui.icon.DragIndicator()
-                    mui.CardMedia(
-                        component="img",
-                        image=f"data:image/png;base64,{it['thumb_b64']}",
-                        sx={"width": 96, "height": 96, "objectFit": "cover",
-                            "borderRadius": "8px", "border": "1px solid rgba(0,0,0,.08)", "flexShrink": 0, "mr": 1},
-                    )
-                    mui.Typography(
-                        it["label"],
-                        sx={"fontSize": "0.95rem", "whiteSpace": "nowrap", "overflow": "hidden", "textOverflow": "ellipsis"},
-                    )
-
-    # Apply new order if updated
-    layout_update = st.session_state.get("reorder_layout")
-    if layout_update:
-        sorted_uids = [
-            entry["i"].replace("item_", "")
-            for entry in sorted(layout_update, key=lambda e: (e.get("y", 0), e.get("x", 0)))
-        ]
-        uid_to_item = {it["uid"]: it for it in items}
-        new_items = [uid_to_item[u] for u in sorted_uids if u in uid_to_item]
-        if len(new_items) == len(items):
-            st.session_state["items"] = new_items
-        st.session_state["reorder_layout"] = None
-        st.rerun()
-
-def fallback_reorder_ui():
-    """
-    Pure‑Streamlit fallback: a data editor showing a thumbnail + label + order number.
-    Click 'Apply order' to commit. Always works, no extra deps.
+    Render a draggable vertical list of thumbnail cards using the HTML5 Drag & Drop API.
+    Returns the latest order of UIDs from the embedded component.
     """
     items = st.session_state["items"]
     if not items:
-        st.info("No items to reorder.", icon="ℹ️")
         return
 
-    rows = []
-    for idx, it in enumerate(items):
-        rows.append({
-            "uid": it["uid"],
-            "Preview": f"data:image/png;base64,{it['thumb_b64']}",
-            "Label": it["label"],
-            "Order": idx + 1,
-            "orig_index": it.get("orig_index", idx),
-        })
-    df = pd.DataFrame(rows)
+    # Build each card's HTML (safe label, embedded thumbnail)
+    cards_html = []
+    for it in items:
+        safe_label = escape(it["label"])
+        img_src = f"data:image/png;base64,{it['thumb_b64']}"
+        card = f"""
+        <div class="card" draggable="true" data-uid="{it['uid']}">
+          <div class="grip">☰</div>
+          <img src="{img_src}" alt="thumb">
+          <div class="label">{safe_label}</div>
+        </div>
+        """
+        cards_html.append(card)
 
-    edited = st.data_editor(
-        df[["Preview", "Label", "Order"]],
-        hide_index=True,
-        use_container_width=True,
-        key="order_table",
-        column_config={
-            "Preview": st.column_config.ImageColumn("Preview", help="Thumbnail"),
-            "Label": st.column_config.TextColumn("Label", disabled=True, width="large"),
-            "Order": st.column_config.NumberColumn(
-                "Order", min_value=1, max_value=len(items), step=1, help="Set the sequence for combining."
-            ),
-        },
-    )
+    # Container height: one row per item (110px-ish)
+    height = min(650, 110 * len(items) + 20)
 
-    # Merge the edited "Order" back with uids so we know which row is which.
-    df.loc[:, "Order"] = edited["Order"].fillna(df["Order"]).astype(int)
+    html = f"""
+    <style>
+      .dd-container {{
+        width: 100%;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }}
+      .card {{
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid rgba(0,0,0,.1);
+        background: rgba(250,250,250,.9);
+        box-shadow: 0 1px 2px rgba(0,0,0,.05);
+      }}
+      .card.dragging {{
+        opacity: 0.7;
+        box-shadow: 0 3px 12px rgba(0,0,0,.15);
+      }}
+      .grip {{
+        font-size: 18px;
+        cursor: grab;
+        user-select: none;
+        color: rgba(0,0,0,.6);
+        width: 20px;
+        text-align: center;
+      }}
+      .card img {{
+        width: 96px; height: 96px; object-fit: cover;
+        border-radius: 8px; border: 1px solid rgba(0,0,0,.08);
+        flex-shrink: 0;
+      }}
+      .card .label {{
+        font-size: 0.95rem;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }}
+    </style>
 
-    c1, c2 = st.columns([1, 6])
-    with c1:
-        if st.button("Apply order", type="primary"):
-            # Stable sort by Order, then original index to break ties.
-            df_sorted = df.sort_values(["Order", "orig_index"], kind="stable")
-            uid_order = df_sorted["uid"].tolist()
-            uid_to_item = {it["uid"]: it for it in items}
-            new_items = [uid_to_item[u] for u in uid_order if u in uid_to_item]
-            if len(new_items) == len(items):
-                st.session_state["items"] = new_items
-                st.success("Order applied.", icon="✅")
-                st.rerun()
-    with c2:
-        st.caption("If you prefer true drag & drop and it works in your environment, use the sidebar to switch modes.")
+    <div id="dd-root" class="dd-container">
+      {''.join(cards_html)}
+    </div>
+
+    <!-- Streamlit component bridge (hosted by Streamlit) -->
+    <script src="https://unpkg.com/streamlit-component-lib@latest/dist/index.js"></script>
+    <script>
+      const root = document.getElementById("dd-root");
+
+      // Find the nearest card after the pointer to decide insert position.
+      function getDragAfterElement(container, y) {{
+        const els = [...container.querySelectorAll('.card:not(.dragging)')];
+        return els.reduce((closest, child) => {{
+          const box = child.getBoundingClientRect();
+          const offset = y - (box.top + box.height / 2);
+          if (offset < 0 && offset > closest.offset) {{
+            return {{ offset: offset, element: child }};
+          }} else {{
+            return closest;
+          }}
+        }}, {{ offset: Number.NEGATIVE_INFINITY }}).element;
+      }}
+
+      function currentOrder() {{
+        return Array.from(root.children).map(el => el.dataset.uid);
+      }}
+
+      function sendOrder() {{
+        // Send array of UIDs back to Streamlit (Python receives as the return value).
+        Streamlit.setComponentValue(currentOrder());
+      }}
+
+      // Attach DnD handlers
+      root.addEventListener('dragstart', (e) => {{
+        const card = e.target.closest('.card');
+        if (!card) return;
+        card.classList.add('dragging');
+        e.dataTransfer.effectAllowed = 'move';
+      }});
+
+      root.addEventListener('dragend', (e) => {{
+        const card = e.target.closest('.card');
+        if (!card) return;
+        card.classList.remove('dragging');
+        sendOrder();
+      }});
+
+      root.addEventListener('dragover', (e) => {{
+        e.preventDefault();
+        const afterElement = getDragAfterElement(root, e.clientY);
+        const dragging = root.querySelector('.card.dragging');
+        if (!dragging) return;
+        if (afterElement == null) {{
+          root.appendChild(dragging);
+        }} else {{
+          root.insertBefore(dragging, afterElement);
+        }}
+      }});
+
+      // Send initial order once so Python sees a value immediately
+      sendOrder();
+    </script>
+    """
+
+    order = components.html(html, height=height, scrolling=True, key="drag_reorder_component")
+    if isinstance(order, list) and len(order) == len(items):
+        uid_to_item = {it["uid"]: it for it in items}
+        new_items = [uid_to_item[u] for u in order if u in uid_to_item]
+        if len(new_items) == len(items):
+            st.session_state["items"] = new_items
 
 
-# =========================
+# -----------------------------
 # Upload & preparation
-# =========================
+# -----------------------------
 uploaded = st.file_uploader(
     "Upload images or PDFs",
     key=f"uploader_{st.session_state['uploader_key']}",
@@ -371,7 +374,7 @@ uploaded = st.file_uploader(
     help="You can upload multiple images (PNG, JPG, WebP, TIFF, BMP, GIF) or PDFs.",
 )
 
-# Only (re)prepare when files actually changed (prevents wiping custom order on rerun)
+# Only (re)prepare when files actually change (prevents wiping custom order on rerun)
 if uploaded:
     signature = tuple((f.name, getattr(f, "size", None)) for f in uploaded)
     if st.session_state.get("uploaded_signature") != signature:
@@ -383,9 +386,6 @@ if uploaded:
 items = st.session_state["items"]
 contains_pdf = st.session_state["contains_pdf"]
 
-# =========================
-# UI
-# =========================
 if items:
     st.subheader("Preview")
     show_thumbnails(items)
@@ -393,17 +393,11 @@ if items:
     if contains_pdf:
         st.info("PDF detected. Page order is fixed to the document’s order. Reordering is disabled.", icon="📄")
     else:
-        st.subheader("Reorder")
-        if reorder_method == "Drag thumbnails (beta)" and HAS_ELEMENTS:
-            drag_reorder_ui()
-        else:
-            if reorder_method == "Drag thumbnails (beta)" and not HAS_ELEMENTS:
-                st.warning("Drag UI not available here. Showing fallback instead.", icon="⚠️")
-            fallback_reorder_ui()
+        st.subheader("Reorder by dragging the previews")
+        drag_reorder_ui()
 
     st.divider()
 
-    # Transcribe button
     can_run = bool(api_key or api_env)
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:
@@ -430,14 +424,13 @@ if items:
             )
 
             status.update(label="Done!", state="complete", expanded=False)
-
 else:
     st.caption("Upload images or PDFs to begin.")
 
 st.markdown(
     """
 ---
-**Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
-**Reordering**: Use **Drag thumbnails (beta)** if it renders properly in your environment, otherwise the **fallback** works everywhere.  
+**Reset** clears the session & the uploader so you can start fresh.  
+**Code Interpreter toggle**: when off, the tool is not sent and the instruction line about it is removed.  
 """
 )

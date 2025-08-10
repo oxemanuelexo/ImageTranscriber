@@ -3,7 +3,7 @@ import io
 import base64
 import asyncio
 import uuid
-from html import escape
+from pathlib import Path
 from typing import List, Dict, Tuple
 
 import streamlit as st
@@ -25,10 +25,9 @@ st.markdown(
 This app sends your images (or PDF pages) to **GPT‑5** to transcribe visible text.
 It **does not** use OCR libraries.
 
-**Notes**
 - Multiple non‑PDF images: **drag the previews** to set order; the final transcript follows that order.  
-- PDFs: pages are kept in document order (reordering disabled).  
-- Exactly **one** image/page is given to GPT‑5 per request; all requests run **in parallel**.
+- PDFs: pages keep the document order (reordering disabled).  
+- Exactly **one** image/page is sent per request; requests run **in parallel**.
 """
 )
 
@@ -42,7 +41,7 @@ api_key = st.sidebar.text_input(
 )
 
 st.sidebar.subheader("Model & Settings")
-model = st.sidebar.text_input("Model", value="gpt-5", help="Uses GPT‑5. Toggle Code Interpreter below.")
+model = st.sidebar.text_input("Model", value="gpt-5", help="Use GPT‑5 (with optional Code Interpreter).")
 use_ci = st.sidebar.checkbox("Use Code Interpreter", value=True)
 max_concurrency = st.sidebar.slider("Parallel requests", 1, 8, 4)
 dpi = st.sidebar.slider("PDF render DPI", 120, 300, 200, 20)
@@ -61,9 +60,9 @@ if st.sidebar.button("🔁 Reset / Clear files"):
     reset_all()
     st.rerun()
 
-# --- Session state ---
+# --- Session state containers ---
 if "items" not in st.session_state:
-    st.session_state["items"] = []  # [{uid, bytes, mime, label, from_pdf, thumb_b64}]
+    st.session_state["items"] = []  # list of dicts: {uid, bytes, mime, label, from_pdf, thumb_b64}
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
@@ -91,7 +90,8 @@ def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
 def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
     try:
         img = Image.open(io.BytesIO(bytes_data))
-        if getattr(img, "is_animated", False) and img.format == "TIFF":
+        # for animated tiff/gif, take first frame
+        if getattr(img, "is_animated", False):
             img = ImageSequence.Iterator(img).__next__()
         img = ImageOps.exif_transpose(img)
         png_bytes = _ensure_png(img)
@@ -117,12 +117,12 @@ def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
-def prepare_items(uploaded_files) -> Tuple[List[Dict,], bool]:
+def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
     """
     Create items:
       - images: one item each
       - PDFs: one item per page (in order)
-    Each item gets a small base64 thumbnail for the drag UI and a stable uid.
+    Each item gets a base64 thumbnail for the drag UI.
     """
     items = []
     contains_pdf = False
@@ -211,7 +211,8 @@ async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrenc
                 try:
                     return await transcribe_one(client, it, model, use_code_interpreter)
                 except APIStatusError as e:
-                    return f"[error {e.status_code}] {getattr(e, 'message', '') or 'API error'}"
+                    code = getattr(e, "status_code", "API")
+                    return f"[error {code}] {getattr(e, 'message', '') or 'API error'}"
                 except Exception as e:
                     return f"[error] {str(e)}"
         tasks = [asyncio.create_task(bound_call(it)) for it in items]
@@ -223,144 +224,37 @@ def show_thumbnails(items: List[Dict]):
         with cols[i % 4]:
             st.image(it["bytes"], caption=it["label"], use_container_width=True)
 
-# ---------- Pure HTML5 drag‑and‑drop (no external packages) ----------
+# -----------------------------
+# Custom drag component (no extra pip)
+# -----------------------------
+# Expect a sibling folder "drag_reorder_component" with index.html
+COMP_PATH = Path(__file__).parent / "drag_reorder_component"
+drag_reorder = components.declare_component("drag_reorder", path=str(COMP_PATH))
+
 def drag_reorder_ui():
     """
-    Render a draggable vertical list of thumbnail cards using the HTML5 Drag & Drop API.
-    Returns the latest order of UIDs from the embedded component.
+    Render a draggable list of image cards (custom HTML5 DnD).
+    Returns nothing; updates st.session_state['items'] when a new order arrives.
     """
     items = st.session_state["items"]
-    if not items:
-        return
-
-    # Build each card's HTML (safe label, embedded thumbnail)
-    cards_html = []
-    for it in items:
-        safe_label = escape(it["label"])
-        img_src = f"data:image/png;base64,{it['thumb_b64']}"
-        card = f"""
-        <div class="card" draggable="true" data-uid="{it['uid']}">
-          <div class="grip">☰</div>
-          <img src="{img_src}" alt="thumb">
-          <div class="label">{safe_label}</div>
-        </div>
-        """
-        cards_html.append(card)
-
-    # Container height: one row per item (110px-ish)
-    height = min(650, 110 * len(items) + 20)
-
-    html = f"""
-    <style>
-      .dd-container {{
-        width: 100%;
-        display: flex;
-        flex-direction: column;
-        gap: 10px;
-      }}
-      .card {{
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px;
-        border-radius: 10px;
-        border: 1px solid rgba(0,0,0,.1);
-        background: rgba(250,250,250,.9);
-        box-shadow: 0 1px 2px rgba(0,0,0,.05);
-      }}
-      .card.dragging {{
-        opacity: 0.7;
-        box-shadow: 0 3px 12px rgba(0,0,0,.15);
-      }}
-      .grip {{
-        font-size: 18px;
-        cursor: grab;
-        user-select: none;
-        color: rgba(0,0,0,.6);
-        width: 20px;
-        text-align: center;
-      }}
-      .card img {{
-        width: 96px; height: 96px; object-fit: cover;
-        border-radius: 8px; border: 1px solid rgba(0,0,0,.08);
-        flex-shrink: 0;
-      }}
-      .card .label {{
-        font-size: 0.95rem;
-        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-      }}
-    </style>
-
-    <div id="dd-root" class="dd-container">
-      {''.join(cards_html)}
-    </div>
-
-    <!-- Streamlit component bridge (hosted by Streamlit) -->
-    <script src="https://unpkg.com/streamlit-component-lib@latest/dist/index.js"></script>
-    <script>
-      const root = document.getElementById("dd-root");
-
-      // Find the nearest card after the pointer to decide insert position.
-      function getDragAfterElement(container, y) {{
-        const els = [...container.querySelectorAll('.card:not(.dragging)')];
-        return els.reduce((closest, child) => {{
-          const box = child.getBoundingClientRect();
-          const offset = y - (box.top + box.height / 2);
-          if (offset < 0 && offset > closest.offset) {{
-            return {{ offset: offset, element: child }};
-          }} else {{
-            return closest;
-          }}
-        }}, {{ offset: Number.NEGATIVE_INFINITY }}).element;
-      }}
-
-      function currentOrder() {{
-        return Array.from(root.children).map(el => el.dataset.uid);
-      }}
-
-      function sendOrder() {{
-        // Send array of UIDs back to Streamlit (Python receives as the return value).
-        Streamlit.setComponentValue(currentOrder());
-      }}
-
-      // Attach DnD handlers
-      root.addEventListener('dragstart', (e) => {{
-        const card = e.target.closest('.card');
-        if (!card) return;
-        card.classList.add('dragging');
-        e.dataTransfer.effectAllowed = 'move';
-      }});
-
-      root.addEventListener('dragend', (e) => {{
-        const card = e.target.closest('.card');
-        if (!card) return;
-        card.classList.remove('dragging');
-        sendOrder();
-      }});
-
-      root.addEventListener('dragover', (e) => {{
-        e.preventDefault();
-        const afterElement = getDragAfterElement(root, e.clientY);
-        const dragging = root.querySelector('.card.dragging');
-        if (!dragging) return;
-        if (afterElement == null) {{
-          root.appendChild(dragging);
-        }} else {{
-          root.insertBefore(dragging, afterElement);
-        }}
-      }});
-
-      // Send initial order once so Python sees a value immediately
-      sendOrder();
-    </script>
-    """
-
-    order = components.html(html, height=height, scrolling=True, key="drag_reorder_component")
-    if isinstance(order, list) and len(order) == len(items):
+    payload = [
+        {
+            "uid": it["uid"],
+            "label": it["label"],
+            "thumb": f"data:image/png;base64,{it['thumb_b64']}",
+        }
+        for it in items
+    ]
+    # Ask component to render; it returns a list of UIDs in the current order
+    new_order = drag_reorder(
+        items=payload,
+        key="drag_reorder",
+        default=[p["uid"] for p in payload],
+        height= max(140, min(560, 110 * len(payload))),  # adaptive height
+    )
+    if new_order and len(new_order) == len(items):
         uid_to_item = {it["uid"]: it for it in items}
-        new_items = [uid_to_item[u] for u in order if u in uid_to_item]
-        if len(new_items) == len(items):
-            st.session_state["items"] = new_items
+        st.session_state["items"] = [uid_to_item[u] for u in new_order if u in uid_to_item]
 
 
 # -----------------------------
@@ -374,7 +268,7 @@ uploaded = st.file_uploader(
     help="You can upload multiple images (PNG, JPG, WebP, TIFF, BMP, GIF) or PDFs.",
 )
 
-# Only (re)prepare when files actually change (prevents wiping custom order on rerun)
+# Only (re)prepare when files actually changed (prevents wiping custom order on rerun)
 if uploaded:
     signature = tuple((f.name, getattr(f, "size", None)) for f in uploaded)
     if st.session_state.get("uploaded_signature") != signature:
@@ -394,16 +288,29 @@ if items:
         st.info("PDF detected. Page order is fixed to the document’s order. Reordering is disabled.", icon="📄")
     else:
         st.subheader("Reorder by dragging the previews")
-        drag_reorder_ui()
+        # Helpful hint if the static component is missing
+        if not COMP_PATH.exists():
+            st.error("drag_reorder_component/ not found. Create it next to app.py (see instructions below).")
+        else:
+            drag_reorder_ui()
 
     st.divider()
 
     can_run = bool(api_key or api_env)
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:
-            results = asyncio.run(
-                transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
-            )
+            # Run concurrently; one image/page per request
+            try:
+                results = asyncio.run(
+                    transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
+                )
+            except RuntimeError:
+                # Fallback if an event loop is already running
+                loop = asyncio.new_event_loop()
+                results = loop.run_until_complete(
+                    transcribe_all(st.session_state["items"], api_key or api_env, model, max_concurrency, use_ci)
+                )
+                loop.close()
 
             st.write("Per‑image results")
             for idx, (it, text) in enumerate(zip(st.session_state["items"], results)):
@@ -430,7 +337,7 @@ else:
 st.markdown(
     """
 ---
-**Reset** clears the session & the uploader so you can start fresh.  
-**Code Interpreter toggle**: when off, the tool is not sent and the instruction line about it is removed.  
+**Privacy**: Files are sent to OpenAI only for transcription; no OCR libraries are used locally.  
+**Drag reorder**: provided by a tiny custom HTML5 component (no extra pip packages).  
 """
 )

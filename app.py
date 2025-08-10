@@ -19,7 +19,6 @@ from streamlit_elements import elements, dashboard, mui, sync
 # Silence a harmless SyntaxWarning in streamlit-elements on Python 3.13
 warnings.filterwarnings("ignore", category=SyntaxWarning)
 
-
 # =========================
 # App setup
 # =========================
@@ -73,14 +72,12 @@ if "items" not in st.session_state:
 if "contains_pdf" not in st.session_state:
     st.session_state["contains_pdf"] = False
 
-
 # =========================
 # Helpers
 # =========================
 ACCEPTED_TYPES = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp", "gif", "pdf"]
 
 def _ensure_png(image: Image.Image) -> bytes:
-    """Convert PIL image to PNG bytes."""
     buf = io.BytesIO()
     if image.mode not in ("RGB", "L", "RGBA"):
         image = image.convert("RGB")
@@ -88,7 +85,6 @@ def _ensure_png(image: Image.Image) -> bytes:
     return buf.getvalue()
 
 def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
-    """Create a small PNG thumbnail for the drag UI."""
     img = Image.open(io.BytesIO(png_bytes))
     img = ImageOps.exif_transpose(img)
     img.thumbnail((max_side, max_side))
@@ -97,10 +93,8 @@ def _make_thumb_bytes(png_bytes: bytes, max_side: int = 160) -> bytes:
     return b.getvalue()
 
 def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
-    """Read any supported image and return (png_bytes, mime, label)."""
     try:
         img = Image.open(io.BytesIO(bytes_data))
-        # If multi-frame TIFF, take first frame (simple handling)
         if getattr(img, "is_animated", False) and img.format == "TIFF":
             img = ImageSequence.Iterator(img).__next__()
         img = ImageOps.exif_transpose(img)
@@ -112,7 +106,6 @@ def _read_single_image(name: str, bytes_data: bytes) -> Tuple[bytes, str, str]:
         raise
 
 def _pdf_to_png_pages(pdf_bytes: bytes, dpi: int = 200) -> List[bytes]:
-    """Render each PDF page to PNG bytes using PyMuPDF."""
     images = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
@@ -129,12 +122,6 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode("utf-8")
 
 def prepare_items(uploaded_files) -> Tuple[List[Dict], bool]:
-    """
-    Create items:
-      - images: one item each
-      - PDFs: one item per page (in original order)
-    Each item gets a small base64 thumbnail used by the drag UI, plus a stable uid.
-    """
     items = []
     contains_pdf = False
     for f in uploaded_files:
@@ -196,7 +183,6 @@ TRANSCRIBE_PROMPT = (
 )
 
 async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_interpreter: bool) -> str:
-    """Send exactly one image to the model (optionally with Code Interpreter)."""
     data_url = to_data_url(item["bytes"], item["mime"])
     kwargs = dict(
         model=model,
@@ -216,7 +202,6 @@ async def transcribe_one(client: AsyncOpenAI, item: Dict, model: str, use_code_i
     return (resp.output_text or "").strip()
 
 async def transcribe_all(items: List[Dict], api_key: str, model: str, concurrency: int, use_code_interpreter: bool) -> List[str]:
-    """Parallel transcription — one request per item."""
     sem = asyncio.Semaphore(concurrency)
     async with AsyncOpenAI(api_key=api_key) as client:
         async def bound_call(it: Dict) -> str:
@@ -238,23 +223,27 @@ def show_thumbnails(items: List[Dict]):
 
 def drag_reorder_ui():
     """
-    Drag‑and‑drop reordering using streamlit‑elements (MUI cards in a 1‑column draggable grid).
+    Drag‑and‑drop reordering using streamlit‑elements (MUI cards).
+    Explicitly set the component height so it’s visible on all hosts.
     """
     items = st.session_state["items"]
     if not items:
+        st.info("No items to reorder.", icon="ℹ️")
         return
 
-    # One card per row (y=index)
+    # One card per row; compute container height so it never collapses to 0.
+    row_height = 110
     layout = [
         dashboard.Item(f"item_{it['uid']}", 0, idx, 1, 1, isResizable=False)
         for idx, it in enumerate(items)
     ]
+    total_height = max(160, row_height * len(items) + 24)
 
-    with elements("reorder_board"):
+    with elements("reorder_board", height=total_height):
         with dashboard.Grid(
             layout,
             cols=1,                  # vertical list
-            rowHeight=110,
+            rowHeight=row_height,
             compactType="vertical",
             draggableHandle=".drag-handle",
             onLayoutChange=sync("reorder_layout"),
@@ -273,11 +262,9 @@ def drag_reorder_ui():
                         "overflow": "hidden",
                     },
                 ):
-                    # Drag handle (use a simple icon)
                     with mui.Box(className="drag-handle", sx={"cursor": "grab", "display": "flex", "alignItems": "center"}):
                         mui.icon.DragIndicator()
 
-                    # Thumbnail
                     mui.CardMedia(
                         component="img",
                         image=f"data:image/png;base64,{it['thumb_b64']}",
@@ -291,8 +278,6 @@ def drag_reorder_ui():
                             "mr": 1,
                         },
                     )
-
-                    # Label
                     mui.Typography(
                         it["label"],
                         sx={
@@ -303,10 +288,9 @@ def drag_reorder_ui():
                         },
                     )
 
-    # If the layout changed, apply the new order and rerun so the Preview updates.
+    # Apply new order (if any) and re-render
     layout_update = st.session_state.get("reorder_layout")
     if layout_update:
-        # Sort by y then x; extract IDs -> uids
         sorted_uids = [
             entry["i"].replace("item_", "")
             for entry in sorted(layout_update, key=lambda e: (e.get("y", 0), e.get("x", 0)))
@@ -317,7 +301,6 @@ def drag_reorder_ui():
             st.session_state["items"] = new_items
         st.session_state["reorder_layout"] = None
         st.rerun()
-
 
 # =========================
 # Upload & preparation
@@ -357,7 +340,6 @@ if items:
 
     st.divider()
 
-    # Transcribe button
     can_run = bool(api_key or api_env)
     if st.button("Transcribe with GPT‑5", disabled=not can_run, help=None if can_run else "Add your OpenAI API key first."):
         with st.status("Transcribing… running parallel requests", expanded=True) as status:

@@ -1,0 +1,7 @@
+streamlit>=1.34
+openai>=1.40
+python-dotenv>=1.0
+Pillow>=10.0
+pypdfium2>=4.9
+pandas>=2.0
+streamlit-aggrid>=1.1.7

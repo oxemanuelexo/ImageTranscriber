@@ -11,12 +11,6 @@ A tiny Streamlit web app that **transcribes text from images** using **OpenAI’
 
 ---
 
-# Demo
-
-> *(Optional)* Add a short GIF or screenshot here showing: upload → drag names → transcribe → combined result.
-
----
-
 # Features
 
 * **Multiple file types**: PNG, JPG/JPEG, WEBP, TIFF, BMP, GIF, and PDF
